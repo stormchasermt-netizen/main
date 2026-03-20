@@ -1,0 +1,211 @@
+/**
+ * Core Philosophy: This ruleset implements a Role-Based Access Control (RBAC) model.
+ * Users are categorized into two groups: standard authenticated users and administrators.
+ * Administrator status is granted by checking the user's authenticated email against a
+ * predefined list, which mirrors the application's client-side logic.
+ *
+ * Data Structure: There are two top-level collections:
+ * - /weather_events/{weatherEventId}: Stores the main application data, which is publicly
+ *   readable by authenticated users.
+ * - /roles_admin/{adminId}: This collection is no longer used for authorization in the rules
+ *   but is kept to show the original design intent. Access is fully blocked.
+ *
+ * Key Security Decisions:
+ * - Admin Role Management: Admin status is now checked via the user's `request.auth.token.email`
+ *   inside the security rules. This is more secure as it relies on the verified identity token
+ *   from Firebase Auth.
+ * - Read Access: Any user who is signed in (including via anonymous auth) can read
+ *   data from the /weather_events collection. This supports the core feature of users
+ *   viewing event models.
+ * - Write Access: Only administrators can write to the /weather_events collection.
+ *   Furthermore, an admin can only update or delete events that they themselves created,
+ *   enforcing an ownership model among admins.
+ *
+ * Denormalization for Authorization:
+ * Each document in /weather_events contains a denormalized `adminId` field. This allows
+ * security rules to perform fast and efficient ownership checks for update and delete
+ * operations without needing to perform any extra `get()` calls on other documents.
+ *
+ */
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ------------------------------------------------------------------------
+    // Helper Functions
+    // ------------------------------------------------------------------------
+
+    /**
+     * Returns true if the user is authenticated.
+     */
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    /**
+     * Returns true if the requesting user is an administrator.
+     * Admin status is determined by checking the user's email from the auth token.
+     * This aligns server-side validation with the client-side logic.
+     */
+    function isAdmin() {
+      return request.auth.token.email in ['stormchasermt@gmail.com', 'admin@previsaomaster.com'];
+    }
+
+    /**
+     * Validates that the `adminId` field in a newly created weather event
+     * matches the UID of the authenticated user.
+     * This ensures creators correctly assign themselves as the owner.
+     */
+    function isEventCreator() {
+      return request.resource.data.adminId == request.auth.uid;
+    }
+
+    /**
+     * Validates that the `adminId` field of an existing document matches
+     * the UID of the authenticated user.
+     * This enforces ownership for updates and deletes.
+     */
+    function isExistingEventOwner() {
+      return resource != null && resource.data.adminId == request.auth.uid;
+    }
+
+    // ------------------------------------------------------------------------
+    // Collection Rules
+    // ------------------------------------------------------------------------
+
+    /**
+     * @description Defines access control for weather event documents.
+     * Any signed-in user can read events. Only admins can create, update, or
+     * delete events they own.
+     */
+    match /weather_events/{weatherEventId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn();
+      allow create: if isAdmin() && isEventCreator();
+      allow update: if isAdmin() && isExistingEventOwner() && request.resource.data.adminId == resource.data.adminId;
+      allow delete: if isAdmin() && isExistingEventOwner();
+    }
+
+    match /scores/{scoreId} {
+       allow read: if true;
+       allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+       allow update, delete: if false;
+    }
+
+    match /lobbies/{lobbyId} {
+      allow read, write: if isSignedIn();
+      match /messages/{messageId} {
+        allow read, create: if isSignedIn();
+      }
+    }
+
+    match /invites/{userId} {
+       allow read, delete: if isSignedIn() && request.auth.uid == userId;
+       allow create: if isSignedIn();
+    }
+
+    // BSWC Previsão & Sondagens
+    match /bswc_forecasts/{forecastId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    match /bswc_reports/{reportId} {
+      allow read: if isSignedIn();
+      allow create, update, delete: if isAdmin();
+    }
+
+    /**
+     * Rastros de tornados: leitura para qualquer usuário logado; criar/atualizar/excluir apenas admin e com adminId igual ao uid.
+     * Documentos antigos sem adminId podem ser atualizados/excluídos por qualquer admin.
+     */
+    match /tornado_tracks/{trackId} {
+      allow get, list: if isSignedIn();
+      allow create: if isAdmin() && request.resource.data.adminId == request.auth.uid;
+      allow update: if isAdmin() && (
+        (resource.get('adminId', '') == '' ) ||
+        (resource.data.adminId == request.auth.uid && request.resource.data.adminId == resource.data.adminId)
+      );
+      allow delete: if isAdmin() && (resource.get('adminId', '') == '' || resource.data.adminId == request.auth.uid);
+    }
+    
+    /**
+     * Previsões Prevots — overlays de tempestades por data. Usado no Modo Ao Vivo.
+     * Leitura: qualquer usuário logado. Escrita: apenas admin.
+     */
+    match /prevots_forecasts/{forecastId} {
+      allow get, list: if isSignedIn();
+      allow create: if isAdmin() && request.resource.data.adminId == request.auth.uid;
+      allow update, delete: if isAdmin() && (
+        resource.get('adminId', '') == '' || resource.data.adminId == request.auth.uid
+      );
+    }
+
+    /**
+     * Configurações de radares meteorológicos (bounds, URL template).
+     * Leitura: qualquer usuário logado (rastros usa para overlay). Escrita: apenas admin.
+     */
+    match /radar_configs/{configId} {
+      allow get, list: if isSignedIn();
+      allow create, update, delete: if isAdmin();
+    }
+
+    /**
+     * @description Presença em tempo real.
+     * Qualquer pessoa pode ler (lista de usuários online é pública).
+     * Apenas o próprio usuário autenticado pode escrever/excluir seu documento.
+     */
+    match /presence/{uid} {
+      allow read: if true;
+      allow write, delete: if isSignedIn() && request.auth.uid == uid;
+    }
+
+    /**
+     * Perfil do usuário na página Rastros de Tornados (nome, tipo: Meteorologista, Storm Chaser, Observador, Civil).
+     * Cada usuário só pode ler e escrever seu próprio perfil.
+     */
+    match /rastros_profiles/{uid} {
+      allow read, write: if isSignedIn() && request.auth.uid == uid;
+    }
+
+    /**
+     * Visitas diárias do site. Contador por data (YYYY-MM-DD).
+     * Leitura: qualquer um (para exibir o contador).
+     * Escrita: usuários logados (increment ao registrar visita).
+     */
+    match /daily_visits/{dateId} {
+      allow read: if true;
+      allow create, update: if isSignedIn();
+      allow delete: if false;
+    }
+
+    /**
+     * Relatos de tempestade enviados pelos usuários (vento, granizo, tornado).
+     * Leitura: qualquer usuário logado. Criação: próprio usuário. Edição/exclusão: bloqueada.
+     */
+    match /storm_reports/{reportId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow update: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow delete: if false;
+    }
+
+    /**
+     * Contador de visualizações por relato. Qualquer usuário logado pode ler e incrementar.
+     */
+    match /report_views/{reportId} {
+      allow read: if isSignedIn();
+      allow create, update: if isSignedIn();
+      allow delete: if false;
+    }
+
+    /**
+     * @description This collection is no longer used for authorization logic in the rules.
+     * All client access is blocked.
+     */
+    match /roles_admin/{adminId} {
+      allow read, write: if false;
+    }
+  }
+}
